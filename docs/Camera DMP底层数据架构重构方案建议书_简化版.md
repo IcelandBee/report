@@ -1,4 +1,4 @@
-# Camera DMP 底层数据架构重构方案建议书（简化版）
+# Agent数据平台底层数据架构重构方案建议书（简化版）
 
 > 文档定位：用于方案沟通与快速评审  
 > 参考方向：火山引擎 LAS 的数据加工分工与 ByteHouse 的在线多模态检索设计  
@@ -6,16 +6,16 @@
 
 ## 1. 方案结论
 
-Camera DMP 已具备数据接入、对象存储、元数据检索、向量检索、标注、质检和工作流等能力。随着数据规模和处理环节增加，原始文件、加工结果、数据版本和在线索引分散管理的问题开始影响追溯、发布、回滚和故障恢复。本次重构的重点是理顺这些数据之间的关系。
+Agent数据平台已具备数据接入、对象存储、元数据检索、向量检索、标注、质检和工作流等能力。随着数据规模和处理环节增加，原始文件、加工结果、数据版本和在线索引分散管理的问题开始影响追溯、发布、回滚和故障恢复。本次重构的重点是理顺这些数据之间的关系。
 
 底层架构按四个平面划分：
 
 1. **S3 数据资产面**：保存原始多模态文件，以及文本、标签、片段、质量结果、Embedding 和数据集版本等派生资产；
 2. **PostgreSQL 业务控制面**：管理数据集、版本、任务、Schema、血缘、权限、审批和发布状态；
-3. **数据加工面**：完成解析、清洗、切分、OCR、ASR、Caption、质检和 Embedding；
+3. **数据加工面**：RabbitMQ 传递任务事件，Celery 负责异步调度、重试并启动 Daft Pipeline，Daft 完成解析、清洗、切分、OCR、ASR、Caption、质检和 Embedding；
 4. **在线服务面**：使用 Doris 或 ClickHouse 保存可检索投影，提供结构化、全文和向量检索。
 
-整体分工是：S3 保存可长期追溯的数据，PostgreSQL 管理业务状态，计算任务生成固定的数据版本，Doris/ClickHouse 提供在线检索。数据库中的元数据、文本、向量和索引均可从 S3 上的固定版本重建。原始文件继续保存在 S3，不因数据库部署在线下服务器而迁移。
+整体分工是：S3 保存可长期追溯的数据，PostgreSQL 管理业务状态，RabbitMQ 传递异步事件，Celery 调度任务并启动 Daft Pipeline，Daft 生成固定的数据版本，Doris/ClickHouse 提供在线检索。数据库中的元数据、文本、向量和索引均可从 S3 上的固定版本重建。原始文件继续保存在 S3，不因数据库部署在线下服务器而迁移。
 
 版本化 Dataset 优先采用 Lance 格式与 SDK。Lance 用于组织标准化样本、文本、标签、质量结果、Embedding 和文件引用；原始大文件仍作为普通对象保存在 S3。第一阶段不部署 LanceDB Server，PoC 不通过时回退到 Parquet + Manifest。
 
@@ -42,7 +42,7 @@ flowchart TB
   SOURCE["数据源<br/>图片 / 视频 / 音频 / 文档 / 元数据"]
 
   subgraph CONTROL["业务控制面"]
-    API["Camera DMP API"]
+    API["Agent数据平台 API"]
     PG[("PostgreSQL<br/>数据集 / 版本 / 任务 / 血缘 / 权限 / 发布状态")]
   end
 
@@ -53,10 +53,12 @@ flowchart TB
   end
 
   subgraph PROCESS["数据加工面"]
-    QUEUE["事件与任务队列"]
-    PIPELINE["解析 / 清洗 / 切分<br/>OCR / ASR / Caption / 质检"]
+    MQ["RabbitMQ<br/>接入 / 加工 / 校验 / 投影事件"]
+    CELERY["Celery<br/>任务路由 / 重试 / 状态协调"]
+    DAFT["Daft Pipeline<br/>读取 / 转换 / 分片 / 批处理"]
+    OPERATOR["多模态算子<br/>解析 / OCR / ASR / Caption / 质检"]
     EMB["Embedding 服务"]
-    CHECK["版本质量校验"]
+    CHECK["Daft 数据校验<br/>Schema / 完整性 / 质量"]
     PROJECTOR["Serving Projector"]
   end
 
@@ -71,17 +73,19 @@ flowchart TB
   SOURCE --> API
   API --> PG
   API --> RAW
-  RAW --> QUEUE
-  PG --> QUEUE
-  QUEUE --> PIPELINE
-  PIPELINE --> EMB
-  PIPELINE --> DERIVED
+  PG --> MQ
+  MQ --> CELERY
+  CELERY --> DAFT
+  DAFT --> OPERATOR
+  OPERATOR --> EMB
+  OPERATOR --> DERIVED
   EMB --> DERIVED
   DERIVED --> CHECK
   CHECK --> VERSION
   CHECK --> PG
   VERSION --> PROJECTOR
   PG --> PROJECTOR
+  CELERY --> PROJECTOR
   PROJECTOR --> DB
   DB --> SEARCH
   PG --> SEARCH
@@ -99,20 +103,36 @@ flowchart TB
 | PostgreSQL | 数据集、版本、Schema、任务、血缘、权限、审批、发布水位 | 业务控制面 |
 | S3 Raw 区 | 图片、视频、音频、文档、压缩包和外部清单 | 原始数据事实 |
 | S3 派生与版本区 | Lance 优先保存文本、标签、片段、质量结果、Embedding、固定版本和业务 Manifest；Parquet + Manifest 作为回退 | 派生数据事实 |
-| 加工任务 | 解析、清洗、切分、OCR、ASR、Caption、质检和向量化 | 多模态数据生产 |
+| RabbitMQ | 接入、加工、校验、投影、删除和重建事件 | 异步消息通道 |
+| Celery | 任务领取、路由、重试、心跳协调，启动 Daft Pipeline 或 Projector | 异步任务调度 |
+| Daft 数据加工层 | 读取、解析、清洗、切分、OCR、ASR、Caption、质检、向量化和版本校验 | 多模态数据生产 |
 | Doris/ClickHouse | 在线元数据、文本、向量和索引 | 可重建服务投影 |
 | Search API | 权限过滤、查询向量化、混合召回、融合、去重和结果封装 | 统一检索入口 |
+
+### 3.3 RabbitMQ、Celery 与 Daft 的分工
+
+PostgreSQL 保存 Job、DatasetVersion 和发布状态等权威业务事实，并通过 Outbox 产生任务事件。RabbitMQ 负责传递事件，Celery 负责任务领取、队列路由、重试和状态协调。加工任务由 Celery 启动独立的 Daft Pipeline，发布任务由 Celery 启动 Projector。
+
+RabbitMQ 消息只传递 `job_id`、输入版本、PipelineVersion、分片和追踪信息，不承载原始文件或大批量数据。Celery 保持轻量调度职责，不在通用 Worker 进程中长期执行大型多模态加工。任务重复投递时，平台通过固定输入版本和稳定幂等键避免生成冲突结果。
+
+### 3.4 Daft 的定位
+
+Daft 负责把 S3 上的原始多模态对象加工成可版本化、可校验、可发布的数据资产。平台使用 Daft Pipeline 组织数据读取、过滤、转换、切分、批处理和结果写出，并将解析、OCR、ASR、Caption、质量检测与 Embedding 封装为标准算子。Daft 不负责任务调度，也不直接写入在线数据库。
+
+大型派生文件写入 S3 标准化区，结构化记录、文件引用、质量结果和向量写入 Lance Dataset。Daft 同时输出记录数量、Schema 校验、父子关联、质量指标和处理血缘。它不负责业务审批和在线查询，也不直接写入 Doris/ClickHouse；在线投影仍由 Projector 在 DatasetVersion 校验通过后执行。
 
 ## 4. 端到端数据流程图
 
 ```text
-图片、视频、音频、文档及业务元数据进入 Camera DMP
+图片、视频、音频、文档及业务元数据进入 Agent数据平台
                             ↓
 原始文件写入 S3 Raw 区，PostgreSQL 登记稳定资产 ID、来源和接入任务
                             ↓
-事件触发数据加工任务
+PostgreSQL 写入任务与 Outbox 事件，RabbitMQ 投递加工消息
                             ↓
-解析、清洗、去重，并按模态生成统一检索单元
+Celery 领取任务、校验固定输入版本并启动 Daft Pipeline
+                            ↓
+Daft 读取原始对象，调用标准算子完成解析、清洗、去重，并按模态生成统一检索单元
 （图片 / 文档块 / 视频片段与关键帧 / 音频片段）
                             ↓
 生成 OCR、ASR、Caption、标签、质量结果和多模态 Embedding
@@ -259,7 +279,7 @@ Lance Version 18（DatasetVersion V2）
 └── Fragment 2：D、E
 ```
 
-Camera DMP 的业务版本只绑定最终校验通过的 Lance 快照：
+Agent数据平台的业务版本只绑定最终校验通过的 Lance 快照：
 
 ```text
 DatasetVersion V2
@@ -305,13 +325,13 @@ ClickHouse 具有现有平台经验、迁移成本低和元数据分析能力成
 | 阶段 | 主要工作 | 阶段成果 |
 |---|---|---|
 | 阶段 0：统一身份 | 盘点数据关系，引入稳定 Asset/Revision/Segment ID 和内容 Hash | 路径不再承担数据身份 |
-| 阶段 1：资产版本化 | 建立 Raw、派生资产和 DatasetVersion，引入并验证 Lance 格式与 SDK，保留 Parquet + Manifest 回退 | 数据版本可复现 |
-| 阶段 2：发布协议 | 建立 Outbox、Projector、索引水位、对账和重建 | 在线数据库成为可重建投影 |
+| 阶段 1：加工与资产版本化 | 打通 PostgreSQL Outbox → RabbitMQ → Celery → Daft，建立标准多模态算子、Raw、派生资产和 DatasetVersion，引入并验证 Lance | 调度和加工边界统一，数据版本可复现 |
+| 阶段 2：发布协议 | 由 RabbitMQ 投递发布事件、Celery 调度 Projector，建立索引水位、死信、任务对账和重建 | 在线数据库成为可重建投影 |
 | 阶段 3：引擎 PoC | Doris 4.x 与 ClickHouse 26.2+ 同条件测试 | 形成可量化选型结论 |
 | 阶段 4：迁移检索 | 历史回填、增量追平、影子查询、统一 Search API 和切换回滚 | 完成生产检索迁移 |
 | 阶段 5：反馈闭环 | 回流标注、质检、训练和评测结果 | 持续生成新数据版本 |
 
-第一阶段不需要立即引入新的分布式计算平台。现有 RabbitMQ、Celery、Polars、PyArrow 和 GPU 作业可以继续使用，并通过分片、幂等、检查点和水位控制改善吞吐。当处理规模超过现有能力边界时，再评估 Ray、Spark 等分布式计算引擎。
+Celery 从 RabbitMQ 领取任务后，先从 PostgreSQL 核对 Job 和固定输入版本，再启动独立的 Daft Pipeline。Daft 以固定 DatasetVersion、PipelineVersion、SchemaVersion 和模型版本作为输入，按稳定分片和幂等路径写出。加工结果必须先落入 S3/Lance 并通过版本校验，再由 Celery 调度 Projector 发布到在线数据库。
 
 ## 9. PoC 重点
 
@@ -349,19 +369,21 @@ PoC 不只比较数据库是否具备某项功能，而应验证完整数据链�
 | Lance 引入额外维护成本 | 批量写入、受控提交、固定格式版本，并验证 S3、Fragment、Compaction 和版本清理 |
 | Doris 检索能力未达到生产要求 | 与 ClickHouse 同条件实测并保留回退能力 |
 | ClickHouse 混合相关性不足 | Search API 融合或集中式向量服务作为后续方案 |
-| Celery 串行任务吞吐不足 | 按版本和分片并行、幂等写入和断点续写 |
+| RabbitMQ 持续积压 | 按任务类型拆分队列和 Worker，消息只传任务引用，并监控队列等待与积压恢复时间 |
+| Celery 重复任务或孤儿任务 | PostgreSQL 保存权威状态，使用 Outbox、稳定幂等键、心跳、死信和周期对账 |
+| Daft Pipeline 分片或批次不合理 | 统一算子输入输出，按数据规模设置分片和批次，记录算子级耗时并持续调优 |
 | 多系统出现半发布 | 固定版本、投影水位、发布前对账和原子切换 |
 | 权限或删除传播不完整 | 在线预过滤、短时 S3 地址、墓碑和分阶段物理回收 |
 
 ## 11. 方案结论
 
-本次改造先建设稳定 ID、S3 数据分层、DatasetVersion、Manifest 和发布协议。原始文件及版本化派生资产保存在 S3；PostgreSQL 继续管理业务、权限、版本、任务和血缘；多模态解析和向量化由数据加工层完成。
+本次改造先建设稳定 ID、S3 数据分层、DatasetVersion、Manifest 和发布协议。原始文件及版本化派生资产保存在 S3；PostgreSQL 管理业务、权限、版本、任务和血缘；RabbitMQ 传递异步任务事件；Celery 负责任务路由、重试并启动独立的 Daft Pipeline 或 Projector；Daft 统一组织多模态解析、标准化、质量校验和向量化。
 
-版本化 Dataset 优先采用 Lance 格式与 SDK。原始大文件继续作为普通 S3 对象保存，Lance 组织标准化数据、文件引用和 Embedding；Camera DMP 业务版本绑定最终校验通过的 Lance 快照。第一阶段不部署 LanceDB Server，验证不通过时回退到 Parquet + Manifest。
+版本化 Dataset 优先采用 Lance 格式与 SDK。原始大文件继续作为普通 S3 对象保存，Lance 组织标准化数据、文件引用和 Embedding；Agent数据平台业务版本绑定最终校验通过的 Lance 快照。第一阶段不部署 LanceDB Server，验证不通过时回退到 Parquet + Manifest。
 
 Doris/ClickHouse 保存可从固定数据版本重建的在线投影。Doris 优先验证，ClickHouse 使用同等条件建立正式基准。Projector、索引水位和原子发布共同控制版本可见性，避免未完成的数据提前进入查询。
 
-现有基础设施在迁移期间继续使用，各项改造按阶段推进，不要求一次性替换整个平台。
+RabbitMQ 和 Celery 作为目标架构中的异步消息与任务调度组件继续使用。Celery 不长期承载大型数据计算，实际加工由 Daft 完成；PostgreSQL 始终保存权威任务和版本状态。
 
 ## 12. 参考材料
 
@@ -373,3 +395,7 @@ Doris/ClickHouse 保存可从固定数据版本重建的在线投影。Doris 优
 - [ClickHouse Vector Search](https://clickhouse.com/docs/reference/engines/table-engines/mergetree-family/annindexes)
 - [ClickHouse Text Index](https://clickhouse.com/docs/reference/engines/table-engines/mergetree-family/textindexes)
 - [Lance Table Format](https://lance.org/format/table/)
+- [Daft 多模态数据处理](https://docs.daft.ai/en/stable/modalities/overview/)
+- [Daft 数据连接器](https://docs.daft.ai/en/stable/connectors/)
+- [RabbitMQ Documentation](https://www.rabbitmq.com/docs)
+- [Celery User Guide](https://docs.celeryq.dev/en/stable/userguide/)
